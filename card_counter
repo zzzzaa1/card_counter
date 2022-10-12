@@ -1,0 +1,464 @@
+--[[
+   card counter
+   created by Rodney
+]]
+
+cardCounterVersion = "2016111300"
+
+-- constants --
+playerColorTable = {}
+for i, v in ipairs({"White", "Brown", "Red", "Orange", "Yellow", "Green", "Teal", "Blue", "Purple", "Pink", "Black", "Grey"}) do
+   playerColorTable[string.lower(v)] = v
+end
+
+-- customizable options in card counter's description part.
+optionDescriptor = {
+   -- text color.
+   -- color name (same as seat name; White, Red...) or "#rrggbb" are supported.
+   color = {
+      type = "custom",
+      decoder = function(value, optionChunk)
+         local result
+         local regularizedColorName = playerColorTable[string.lower(value)]
+
+         if regularizedColorName then
+            local rgb = stringColorToRGB(regularizedColorName)
+            result = {rgb.r, rgb.g, rgb.b}
+         else
+            result = hexColorStringToRGB(value) or {1, 1, 1}
+         end
+
+         return result
+      end,
+
+      default = {1, 1, 1}
+   },
+
+   -- text size.
+   size = {
+      type = "number",
+      default = 44
+   },
+   
+   -- text format.
+   -- See http://www.lua.org/manual/5.2/manual.html#pdf-string.format
+   format = {
+      type = "string",
+      default = "x%d"
+   },
+
+   -- text offset position.
+   offset = {
+      type = "custom",
+      decoder = function(value, optionChunk)
+         local result = split(value, ",")
+
+         result[1] = tonumber(result[1]) or 0
+         result[2] = tonumber(result[2]) or 0
+         result[3] = tonumber(result[3]) or 0
+
+         return result
+      end,
+      default = {0, 0, 0}
+   },
+
+   -- text rotation.
+   rotation = {
+      type = "number",
+      default = 0
+   },
+
+   -- raise text to deck's height.
+   -- if this is true, text is raised to fit to deck's height.
+   raise = {
+      type = "boolean",
+      default = true
+   },
+
+   -- aspect ratio.
+   -- vertical / horizontal scale.
+   aspectratio = {
+      type = "number",
+      default = 1
+   }
+}
+
+
+-- target object's GUID/label text's GUID association table
+labelAssoc = {}
+
+-- currently spawning labels (not initialized)
+spawningLabels = {}
+
+-- label's temporary spawning position
+tempPosition = {0, -30, 0}
+
+
+-- workaround variable for onLoad/onCollisionEnter event's order.
+beforeLoading = true
+collideBeforeLoadQueue = {}
+
+-- events --
+function onSave()
+   return JSON.encode(labelAssoc)
+end
+
+function onLoad(saved)
+   if saved then
+      labelAssoc = JSON.decode(saved) or {}
+   end
+
+   for t, l in pairs(labelAssoc) do
+      local target = getObjectFromGUID(t)
+      local label = getObjectFromGUID(l)
+
+      if label == nil then
+         labelAssoc[t] = nil
+      elseif target == nil then
+         labelAssoc[t] = nil
+         label.destruct()
+      end
+   end
+
+   beforeLoading = false
+
+   for i, v in ipairs(collideBeforeLoadQueue) do
+      onCollisionEnter(v)
+   end
+   collideBeforeLoadQueue = {}
+
+   fixAspectRatio()
+end
+
+function onDestroy()
+   for t, l in pairs(labelAssoc) do
+      destroyLabel(t)
+   end
+end
+
+function onCollisionEnter(info)
+   if info and info.collision_object.guid then
+      if beforeLoading then
+         collideBeforeLoadQueue[#collideBeforeLoadQueue+1] = info
+         return
+      end
+         
+      local options = decodeOptionText(self.getDescription(), optionDescriptor)
+      local target = getObjectFromGUID(info.collision_object.guid)
+      local count = -1
+
+      if target.tag == "Card" then
+         count = 1
+      elseif target.tag == "Deck" then
+         count = #target.getObjects()
+      end
+
+      -- card/deck only 
+      if count > -1 then
+         if count == 0  then
+            destroyLabel(target.guid)
+         else
+            setLabelText(target.guid, count)
+         end
+      end
+   end
+end
+
+function onCollisionExit(info)
+   if info and info.collision_object.guid and labelAssoc[info.collision_object.guid] then
+      destroyLabel(info.collision_object.guid)
+   end
+end
+
+function onObjectDestroyed(target)
+   if labelAssoc[target.guid] then
+      destroyLabel(target.guid)
+   end
+end
+
+function onPickedUp()
+   for t, l in pairs(labelAssoc) do
+      destroyLabel(t)
+   end
+
+   fixAspectRatio()
+end
+
+-- functions --
+
+-- create new label text ofject for targetGuid.
+-- this function uses asynchronously callback, so needs mutex variable.
+function newLabel(targetGuid, params)
+   if spawningLabels[targetGuid] then
+      return
+   end
+
+   local label = spawnObject({
+         type = "3DText",
+         position = tempPosition,
+         rotation = {0, 0, 0},
+         callback = "newLabelCallback",
+         callback_owner = self,
+         params = {
+            targetGuid = targetGuid,
+            count = params.count
+         }
+   })
+
+   spawningLabels[targetGuid] = label
+
+   return label
+end
+
+-- callback function for spawning label text object.
+function newLabelCallback(spawnedLabel, params)
+   if params.targetGuid then
+      labelAssoc[params.targetGuid] = spawnedLabel.guid
+      local target = getObjectFromGUID(params.targetGuid)
+
+      -- move functions only affects after initialized.
+      moveLabel(getObjectFromGUID(params.targetGuid), spawnedLabel, params.count)
+   end
+
+   spawningLabels[params.targetGuid] = nil
+end
+
+-- set label's text for targetGuid.
+-- if label object isn't found, new entity is spawned.
+function setLabelText(targetGuid, count)
+   local options = decodeOptionText(self.getDescription(), optionDescriptor)
+   local label = getObjectFromGUID(labelAssoc[targetGuid])
+
+   if not label then
+      label = spawningLabels[targetGuid] or newLabel(targetGuid, {count = count})
+   end
+
+   local target = getObjectFromGUID(targetGuid)
+
+   -- rare case: target is destroyed after new label is spawned but not initialized.
+   if target == nil then
+      destroyLabel(targetGuid)
+      return
+   end
+
+   -- format text
+   label.TextTool.setValue(string.format(options.format, count))
+   label.TextTool.setFontColor(options.color)
+   label.TextTool.setFontSize(options.size * target.getScale().x)
+
+   -- if already initialized, move here.
+   if label.guid then
+      moveLabel(target, label, count)
+   end
+end
+
+function moveLabel(target, label, count)
+   local options = decodeOptionText(self.getDescription(), optionDescriptor)
+
+   -- move label position
+   local raised = 0.165
+
+   if count ~= nil and options.raise then
+      if count < 10 then
+         raised = 0.17
+      elseif count > 214 then
+         raised = raised + 0.00966 * (214 - 10)
+      else
+         raised = raised + 0.00966 * (count - 10)
+      end
+   end
+
+   local zFace = 0
+   local offsetDirection = 1
+   local origin = {
+      position = target.getPosition(),
+      rotation = target.getRotation(),
+      scale = target.getScale()
+   }
+
+   -- flipped?
+   if origin.rotation.z > 90 and origin.rotation.z < 270 then
+      zFace = 180
+      offsetDirection = -1
+   end
+
+   -- fix height & scale
+   -- origin.position.y = self.getPosition().y
+   origin.scale.y = 1.0
+
+   local result = calcRelativePosition(origin, {
+                                          position = {
+                                             offsetDirection * -options.offset[1],
+                                             -- offsetDirection * (options.offset[2] + raised),
+                                             offsetDirection * (options.offset[2] + raised / 2),
+                                             options.offset[3]
+                                          },
+                                          rotation = {90, 180 + options.rotation, zFace}
+   })
+
+   label.setPosition(result.position)
+   label.setRotation(result.rotation)
+end
+
+-- destroy label object for targetGuid.
+function destroyLabel(targetGuid)
+   local label = getObjectFromGUID(labelAssoc[targetGuid]) or spawningLabels[targetGuid]
+   
+   if label then
+      label.destruct()
+      labelAssoc[targetGuid] = nil
+      spawningLabels[targetGuid] = nil
+   end
+end
+
+-- fix aspect ratio of card counter itself.
+function fixAspectRatio()
+   local options = decodeOptionText(self.getDescription(), optionDescriptor)
+   local scale = self.getScale()
+
+   scale.z = scale.x * options.aspectratio
+
+   self.setScale(scale)
+end
+
+---- utility functions
+
+-- spawn object at relative position of baseObj
+--  origin : origin object position, rotation and scale
+--   {position = {x = xpos, y = ypos, z = zpos}, rotation = {x = xrot, y = yrot, z = zrot, scale = {x = xscale, y = yscale, z = zscale}}}
+--  objParam : object parameter. position and rotation is relative.
+--  => objParam
+function calcRelativePosition(origin, objParam)
+   -- calc scaled position
+   objParam.position[1] = objParam.position[1] * origin.scale.x
+   objParam.position[2] = objParam.position[2] * origin.scale.y
+   objParam.position[3] = objParam.position[3] * origin.scale.z
+
+   -- calc absolute rotation
+   objParam.rotation[1] = objParam.rotation[1] + origin.rotation.x
+   objParam.rotation[2] = objParam.rotation[2] + origin.rotation.y
+   objParam.rotation[3] = objParam.rotation[3] + origin.rotation.z
+   
+   -- calc absolute position
+   -- y rotation only
+   local cosX = math.cos(math.rad(origin.rotation.x))
+   local sinX = math.sin(math.rad(origin.rotation.x))
+   local cosY = math.cos(math.rad(origin.rotation.y))
+   local sinY = math.sin(math.rad(origin.rotation.y))
+   local cosZ = math.cos(math.rad(origin.rotation.z))
+   local sinZ = math.sin(math.rad(origin.rotation.z))
+   local x, y, z = objParam.position[1], objParam.position[2], objParam.position[3]
+
+   -- TTS rotation order: Z-X-Y (same as Unity)
+
+   -- rotate Z axis
+   local x1 = x * cosZ - y * sinZ
+   local y1 = x * sinZ + y * cosZ
+   local z1 = z
+
+   -- rotate X axis
+   local x2 = x1
+   local y2 = y1 * cosX - z1 * sinX
+   local z2 = y1 * sinX + z1 * cosX
+
+   -- rotate Y axis
+   local x3 = x2 * cosY + z2 * sinY
+   local y3 = y2
+   local z3 = -x2 * sinY + z2 * cosY
+   
+   objParam.position[1] = x3 + origin.position.x
+   objParam.position[2] = y3 + origin.position.y
+   objParam.position[3] = z3 + origin.position.z
+   
+   return objParam
+end
+
+-- convert key=value list to table
+--  optionText : string of key(delim)value list delimited by newline
+--  descriptor : option entry descriptor
+-- => table of key/value
+function decodeOptionText(optionText, descriptor)
+   local booleanTable = {["true"] = true, ["false"] = false}
+   local result = {}
+
+   for i, line in ipairs(split(optionText, "\n")) do
+      local key, value = string.match(line, "^%s*([^%s=]+)%s*=%s*(.-)%s*$")
+      if key ~= nil then
+         key = string.lower(key)
+         
+         descEntry = descriptor[key]
+
+         if descEntry then
+            if descEntry.type == "select" and descEntry.values then
+               value = descEntry.values[string.lower(value)]
+            elseif descEntry.type == "boolean" then
+               value = booleanTable[string.lower(value)]
+            elseif descEntry.type == "number" then
+               value = tonumber(value)
+            elseif descEntry.type == "custom" and descEntry.decoder then
+               value = descEntry.decoder(value, result)
+            end
+         end
+
+         result[key] = value
+      end
+   end
+
+   -- recover default value
+   for key, descEntry in pairs(descriptor) do
+      if result[key] == nil then
+         result[key] = descEntry.default
+      end
+   end
+
+   return result
+end
+
+-- split str by delim
+--  str : string
+--  delim : string
+-- => table of string
+function split(str, delim)
+   local wordStart = 1
+   local result = {}
+
+   repeat
+      local delimStart, delimEnd = string.find(str, delim, wordStart, 1)
+      
+      if delimStart ~= nil then
+	 result[#result+1] = string.sub(str, wordStart, delimStart - 1)
+	 wordStart = delimEnd + 1
+      end
+   until delimStart == nil
+
+   result[#result+1] = string.sub(str, wordStart)
+   return result
+end
+
+-- split "#rrggbb" style color string to "rr", "gg", "bb"
+--  hexStr : string
+--  => "rr", "gg", "bb"
+function splitHexColorString(hexStr)
+   if hexStr == nil then
+      return nil
+   end
+
+   return string.match(hexStr,
+                       "^#([%da-fA-F][%da-fA-F])" ..
+                          "([%da-fA-F][%da-fA-F])" ..
+                          "([%da-fA-F][%da-fA-F])$")
+end
+
+-- convert "#rrggbb" style color string to {r, g, b}
+--  each element takes between 0 and 1 value.
+--  hexStr : string
+--  => {r, g, b}
+function hexColorStringToRGB(hexStr)
+   local result = nil
+
+   local r, g, b = splitHexColorString(hexStr)
+   if r then
+      result = {tonumber(r, 16) / 255, tonumber(g, 16) / 255, tonumber(b, 16) / 255}
+   end
+   return result
+end
